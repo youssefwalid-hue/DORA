@@ -1,0 +1,1587 @@
+# ============================================================
+# FINAL UNIFIED SCRIPT: DORA x DSO360 - Security KPI Data Extract
+# Refactored from the 2 provided source scripts
+# Version: 2.2 - 2026-08-21
+# Compatible with Windows PowerShell 5.1+
+# ============================================================
+
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+    chcp 65001 | Out-Null
+} catch {}
+
+# ============================================================
+# GLOBAL CONFIGURATION
+# ============================================================
+$script:Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+$script:Session.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+
+$script:ContentType      = "application/json"
+$script:BaseUrlDORA      = "https://refa-group.d.bbg"
+$script:BaseUrlDSO360    = "https://dso360.mycloud.intranatixis.com"
+$script:BaseUrlDSO360API = "https://tes.mycloud.intranatixis.com"
+
+$script:PageSizeDORA      = 50
+$script:PageSizeDSO360    = 100
+$script:PageSizeModules   = 500
+$script:RequestTimeoutSec = 90
+
+$script:ExecutionStart    = Get-Date
+$script:Timestamp         = Get-Date -Format "yyyyMMdd_HHmmss"
+$script:DateDay           = Get-Date -Format "dd"
+$script:OutputPathJSON    = ".\DETAILED_DATA_EXTRACT_SCA_KPI_${script:DateDay}_${script:Timestamp}.json"
+
+$script:Utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+
+$script:Stats = [ordered]@{
+    DoraApiErrors          = 0
+    DsoApiErrors           = 0
+    ModuleApiErrors        = 0
+    ProcessingErrors       = 0
+    Warnings               = 0
+    MatchingByCIA          = 0
+    MatchingByExactName    = 0
+    MatchingByPartialName  = 0
+    MatchingNone           = 0
+    ModulesNotFound        = 0
+    Modules404             = 0
+    ModulesEmpty           = 0
+    ModulesSuccess         = 0
+}
+
+# ============================================================
+# GENERIC HELPERS
+# ============================================================
+
+function Save-JsonUTF8 {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [Parameter(Mandatory = $true)][object]$Data
+    )
+    $json = $Data | ConvertTo-Json -Depth 50
+    [System.IO.File]::WriteAllText(
+        (Join-Path (Get-Location).Path ($FilePath -replace "^\.\\")),
+        $json,
+        $script:Utf8NoBom
+    )
+}
+
+function Normalize-Text {
+    param([AllowNull()][string]$Text)
+    if ([string]::IsNullOrWhiteSpace($Text)) { return "" }
+    $normalized = $Text.Trim().ToLowerInvariant()
+    $normalized = $normalized -replace '\s+', ' '
+    return $normalized
+}
+
+function Get-PropertyValue {
+    param(
+        [Parameter(Mandatory = $true)][object]$Object,
+        [Parameter(Mandatory = $true)][string[]]$PropertyNames
+    )
+
+    foreach ($name in $PropertyNames) {
+        if ($null -ne $Object -and $Object.PSObject.Properties.Name -contains $name) {
+            $value = $Object.$name
+            if ($null -ne $value -and "$value" -ne "") {
+                return $value
+            }
+        }
+    }
+    return $null
+}
+
+function Test-IsSpecificDevelopment {
+    param([object]$App)
+
+    try {
+        if ($null -eq $App.characteristicCriteria) { return $false }
+        if ($null -eq $App.characteristicCriteria.natures) { return $false }
+
+        foreach ($nat in $App.characteristicCriteria.natures) {
+            if ($nat.code -eq "DEV") { return $true }
+
+            $labelEn = if ($nat.labelEn) { "$($nat.labelEn)" } else { "" }
+            $labelFr = if ($nat.labelFr) { "$($nat.labelFr)" } else { "" }
+
+            if ($labelEn -match "Specific development") { return $true }
+            if ($labelFr -match "Developpement specifique|Développement spécifique") { return $true }
+        }
+
+        return $false
+    }
+    catch {
+        $script:Stats.ProcessingErrors++
+        return $false
+    }
+}
+
+function Get-ApplicationDisplayName {
+    param([object]$App)
+    return (Get-PropertyValue -Object $App -PropertyNames @("name","appName","label","applicationName","project"))
+}
+
+function Get-ApplicationNatureText {
+    param([object]$App)
+
+    try {
+        if ($null -eq $App.characteristicCriteria -or $null -eq $App.characteristicCriteria.natures) {
+            return "N/A"
+        }
+
+        $labels = @()
+        foreach ($nat in $App.characteristicCriteria.natures) {
+            if ($nat.labelEn) {
+                $labels += [string]$nat.labelEn
+            }
+            elseif ($nat.code) {
+                $labels += [string]$nat.code
+            }
+        }
+
+        if ($labels.Count -eq 0) { return "N/A" }
+        return ($labels -join "/")
+    }
+    catch {
+        return "N/A"
+    }
+}
+
+function New-NaFields {
+    return [ordered]@{
+        DSO360_ScanExist             = "N/A"
+        DSO360_Matched               = "N/A"
+        DSO360_MatchType             = "N/A"
+        DSO360_AppName               = "N/A"
+        DSO360_ScanStatus            = "N/A"
+        DSO360_SCA_Globale_LastScan  = "N/A"
+        NB_Modules                   = "N/A"
+        Liste_Modules                = "N/A"
+        DSO360_SCA_Module_Last       = "N/A"
+        DSO360_Modules_Detail        = "N/A"
+        DSO360_Modules_Status        = "N/A"
+        DSO360_RawEntry              = $null
+        DSO360_Modules_Raw           = $null
+        DSO360_ModuleFetchStatus     = "N/A"
+        DSO360_ModuleFetchMessage    = "N/A"
+    }
+}
+
+function Write-AppProcessingStatus {
+    param(
+        [Parameter(Mandatory = $true)][int]$Current,
+        [Parameter(Mandatory = $true)][int]$Total,
+        [Parameter(Mandatory = $true)][string]$CIA,
+        [Parameter(Mandatory = $true)][string]$ApplicationName,
+        [Parameter(Mandatory = $true)][string]$Nature,
+        [Parameter(Mandatory = $true)][string]$Status
+    )
+
+    $prefix = "[{0}/{1}] [CIA: {2}] [{3}] [Nature: {4}] [" -f $Current, $Total, $CIA, $ApplicationName, $Nature
+    Write-Host $prefix -ForegroundColor White -NoNewline
+
+    switch ($Status) {
+        "MATCH" {
+            Write-Host "MATCH" -ForegroundColor Green -NoNewline
+        }
+        "NO MATCH" {
+            Write-Host "NO MATCH" -ForegroundColor Red -NoNewline
+        }
+        default {
+            Write-Host "NOT APPLICABLE" -ForegroundColor Yellow -NoNewline
+        }
+    }
+
+    Write-Host "]" -ForegroundColor White
+}
+
+# ============================================================
+# JWT HELPERS
+# ============================================================
+
+function Decode-JWTInfo {
+    param([string]$Token)
+    try {
+        $parts = $Token.Split(".")
+        if ($parts.Count -lt 2) { return $null }
+        $payload = $parts[1]
+        $padded  = $payload.PadRight($payload.Length + (4 - $payload.Length % 4) % 4, "=")
+        $padded  = $padded -replace "-", "+" -replace "_", "/"
+        $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($padded))
+        return $decoded | ConvertFrom-Json
+    }
+    catch { return $null }
+}
+
+function Show-TokenInfo {
+    param(
+        [string]$Token,
+        [string]$SystemName
+    )
+
+    Write-Host ""
+    Write-Host "  Token information [$SystemName]:" -ForegroundColor Cyan
+
+    $jwtData = Decode-JWTInfo -Token $Token
+    if ($null -eq $jwtData) {
+        Write-Host "  (Unable to decode token information)" -ForegroundColor Gray
+        return $true
+    }
+
+    if ($jwtData.given_name -and $jwtData.family_name) {
+        Write-Host "  User         : $($jwtData.given_name) $($jwtData.family_name)" -ForegroundColor White
+    }
+    elseif ($jwtData.name) {
+        Write-Host "  User         : $($jwtData.name)" -ForegroundColor White
+    }
+    elseif ($jwtData.preferred_username) {
+        Write-Host "  Login        : $($jwtData.preferred_username)" -ForegroundColor White
+    }
+
+    if ($jwtData.email) {
+        Write-Host "  Email        : $($jwtData.email)" -ForegroundColor White
+    }
+
+    if ($jwtData.exp) {
+        $expDate   = [System.DateTimeOffset]::FromUnixTimeSeconds([int64]$jwtData.exp).ToLocalTime()
+        $now       = [System.DateTimeOffset]::Now
+        $remaining = $expDate - $now
+
+        if ($remaining.TotalMinutes -lt 0) {
+            Write-Host "  Expiration   : EXPIRED since $([Math]::Abs([int]$remaining.TotalMinutes)) minutes" -ForegroundColor Red
+            return $false
+        }
+        elseif ($remaining.TotalMinutes -lt 10) {
+            Write-Host "  Expiration   : in $([int]$remaining.TotalMinutes) min - WARNING almost expired" -ForegroundColor Red
+        }
+        else {
+            Write-Host "  Expiration   : $($expDate.ToString('yyyy-MM-dd HH:mm:ss')) (in $([int]$remaining.TotalHours)h $($remaining.Minutes)min)" -ForegroundColor Green
+        }
+    }
+    return $true
+}
+
+function Get-BearerToken {
+    param(
+        [string]$SystemName,
+        [string]$SystemUrl,
+        [string]$Instructions
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host " AUTHENTICATION: $SystemName" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host ""
+    Write-Host $Instructions -ForegroundColor White
+    Write-Host ""
+    Write-Host "Opening browser on: $SystemUrl" -ForegroundColor Yellow
+
+    try {
+        Start-Process $SystemUrl
+        Write-Host "OK - Browser opened." -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "Unable to open browser automatically."
+        Write-Host "Open manually: $SystemUrl" -ForegroundColor Yellow
+    }
+
+    $token       = ""
+    $attempt     = 0
+    $maxAttempts = 3
+
+    while ($token -eq "" -and $attempt -lt $maxAttempts) {
+        $attempt++
+        Write-Host ""
+        Write-Host "Attempt $attempt / $maxAttempts" -ForegroundColor Yellow
+        Write-Host "Paste the full Authorization token (Bearer eyJ...):" -ForegroundColor White
+        Write-Host "(The token will not be displayed on screen for security reasons)" -ForegroundColor Gray
+        Write-Host ""
+
+        $secureToken = Read-Host -AsSecureString "Token $SystemName"
+
+        $bstr       = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
+        $tokenPlain = [System.Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+
+        $tokenPlain = $tokenPlain.Trim()
+        $tokenPlain = $tokenPlain -replace "[\r\n]", ""
+
+        if ($tokenPlain -match "^(?i)Bearer\s+(.+)$") {
+            $tokenPlain = $Matches[1].Trim()
+        }
+
+        if ([string]::IsNullOrWhiteSpace($tokenPlain)) {
+            Write-Warning "Empty token. Please try again."
+            continue
+        }
+
+        $token = $tokenPlain
+        Write-Host ""
+        Write-Host "OK - Token [$SystemName] accepted." -ForegroundColor Green
+
+        $valid = Show-TokenInfo -Token $token -SystemName $SystemName
+        if ($valid -eq $false) {
+            Write-Warning "Expired token. Please obtain a new token and try again."
+            $token = ""
+        }
+    }
+
+    if ($token -eq "") {
+        Write-Error "ERROR - Token [$SystemName] invalid after $maxAttempts attempts."
+        exit 1
+    }
+
+    return $token
+}
+
+# ============================================================
+# HEADERS
+# ============================================================
+
+function New-DoraHeaders {
+    param([Parameter(Mandatory = $true)][string]$Token)
+    return @{
+        "Language"           = "en"
+        "sec-ch-ua-platform" = "`"Windows`""
+        "Authorization"      = "Bearer $Token"
+        "Referer"            = "$($script:BaseUrlDORA)/"
+        "sec-ch-ua"          = "`"Not;A=Brand`";v=`"8`", `"Chromium`";v=`"150`", `"Google Chrome`";v=`"150`""
+        "sec-ch-ua-mobile"   = "?0"
+        "Accept"             = "application/json, text/plain, */*"
+    }
+}
+
+function New-Dso360Headers {
+    param([Parameter(Mandatory = $true)][string]$Token)
+    return @{
+        "Accept"             = "application/json, text/plain, */*"
+        "Accept-Encoding"    = "gzip, deflate, br, zstd"
+        "Accept-Language"    = "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7"
+        "Authorization"      = "Bearer $Token"
+        "Origin"             = $script:BaseUrlDSO360
+        "Referer"            = "$($script:BaseUrlDSO360)/"
+        "Sec-Fetch-Dest"     = "empty"
+        "Sec-Fetch-Mode"     = "cors"
+        "Sec-Fetch-Site"     = "same-site"
+        "X-Requested-With"   = "XMLHttpRequest"
+        "sec-ch-ua"          = "`"Not;A=Brand`";v=`"8`", `"Chromium`";v=`"150`", `"Google Chrome`";v=`"150`""
+        "sec-ch-ua-mobile"   = "?0"
+        "sec-ch-ua-platform" = "`"Windows`""
+    }
+}
+
+# ============================================================
+# API WRAPPERS
+# ============================================================
+
+function Invoke-DoraApi {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [ValidateSet("GET","POST")][string]$Method = "GET",
+        [hashtable]$Headers,
+        [object]$Body = $null
+    )
+
+    try {
+        $invokeParams = @{
+            Uri         = $Uri
+            Method      = $Method
+            WebSession  = $script:Session
+            Headers     = $Headers
+            TimeoutSec  = $script:RequestTimeoutSec
+            ErrorAction = "Stop"
+        }
+
+        if ($Method -eq "POST") {
+            $invokeParams["ContentType"] = $script:ContentType
+            if ($null -ne $Body) {
+                $invokeParams["Body"] = ($Body | ConvertTo-Json -Depth 30 -Compress)
+            }
+        }
+
+        if ($PSVersionTable.PSVersion.Major -le 5) {
+            $invokeParams["UseBasicParsing"] = $true
+        }
+
+        $response = Invoke-WebRequest @invokeParams
+        if ($response.Content) { return ($response.Content | ConvertFrom-Json) }
+        return $null
+    }
+    catch {
+        $script:Stats.DoraApiErrors++
+        throw
+    }
+}
+
+function Invoke-Dso360Api {
+    param(
+        [Parameter(Mandatory = $true)][string]$Uri,
+        [ValidateSet("GET","POST")][string]$Method = "GET",
+        [hashtable]$Headers,
+        [object]$Body = $null
+    )
+
+    try {
+        $invokeParams = @{
+            Uri         = $Uri
+            Method      = $Method
+            WebSession  = $script:Session
+            Headers     = $Headers
+            TimeoutSec  = $script:RequestTimeoutSec
+            ErrorAction = "Stop"
+        }
+
+        if ($Method -eq "POST") {
+            $invokeParams["ContentType"] = $script:ContentType
+            if ($null -ne $Body) {
+                $invokeParams["Body"] = ($Body | ConvertTo-Json -Depth 30 -Compress)
+            }
+        }
+
+        if ($PSVersionTable.PSVersion.Major -le 5) {
+            $invokeParams["UseBasicParsing"] = $true
+        }
+
+        $response = Invoke-WebRequest @invokeParams
+        if ($response.Content) { return ($response.Content | ConvertFrom-Json) }
+        return $null
+    }
+    catch {
+        $script:Stats.DsoApiErrors++
+        throw
+    }
+}
+
+# ============================================================
+# DORA REQUEST BODIES
+# ============================================================
+
+function New-DoraBaseSearchObject {
+    param(
+        [int]$PageNumber = 1,
+        [int]$PageSize = 50
+    )
+
+    return [ordered]@{
+        groupId             = $null
+        editors             = $null
+        localId             = @{
+            value   = $null
+            isExact = $true
+        }
+        cia                 = $null
+        name                = @{
+            value   = $null
+            isExact = $false
+        }
+        states              = $null
+        statuses            = @(
+            @{
+                code            = "PRD"
+                label           = @{
+                    labelEn = "Deployed"
+                    labelFr = "En production"
+                }
+                validityEnd     = $null
+                isForActiveApps = $true
+                legacyCode      = "SA1"
+            },
+            @{
+                code            = "DEV"
+                label           = @{
+                    labelEn = "In development"
+                    labelFr = "En developpement"
+                }
+                validityEnd     = $null
+                isForActiveApps = $true
+                legacyCode      = "SA2"
+            }
+        )
+        type                = $null
+        levels              = $null
+        responsibleEntities = $null
+        paging              = @{
+            pageNumber = $PageNumber
+            pageSize   = $PageSize
+        }
+        ordering            = @(
+            @{
+                property  = "groupId"
+                direction = "ASC"
+            }
+        )
+        doraCriteria        = @{
+            isCurrentVersion = $true
+            doraValueList    = @(
+                @{
+                    id          = 1
+                    label       = @{
+                        labelEn = "DORA Group Core"
+                        labelFr = "DORA Groupe coeur"
+                    }
+                    validityEnd = $null
+                },
+                @{
+                    id          = 2
+                    label       = @{
+                        labelEn = "DORA Group Satellite"
+                        labelFr = "DORA Groupe satellites"
+                    }
+                    validityEnd = $null
+                },
+                @{
+                    id          = 3
+                    label       = @{
+                        labelEn = "DORA Group technical base"
+                        labelFr = "DORA Groupe socle technique"
+                    }
+                    validityEnd = $null
+                },
+                @{
+                    id          = 4
+                    label       = @{
+                        labelEn = "DORA Local"
+                        labelFr = "DORA Local"
+                    }
+                    validityEnd = $null
+                }
+            )
+        }
+    }
+}
+
+function New-DoraNatureSearchBody {
+    param(
+        [Parameter(Mandatory = $true)][string]$NatureCode,
+        [Parameter(Mandatory = $true)][string]$LabelEn,
+        [Parameter(Mandatory = $true)][string]$LabelFr,
+        [Parameter(Mandatory = $true)][string]$LegacyCode
+    )
+
+    $body = New-DoraBaseSearchObject -PageNumber 1 -PageSize 9999
+    $body["characteristicCriteria"] = @{
+        isCurrentVersion = $true
+        natures          = @(
+            @{
+                code        = $NatureCode
+                label       = @{
+                    labelEn = $LabelEn
+                    labelFr = $LabelFr
+                }
+                validityEnd = $null
+                legacyCode  = $LegacyCode
+                modifiedBy  = @{ id = "58528T" }
+                modifiedOn  = 1776076193000
+                status      = "ACTIVE"
+            }
+        )
+    }
+
+    return $body
+}
+
+function Get-DoraNatureConfigurations {
+    return @(
+        @{
+            code       = "DEV"
+            labelEn    = "Specific development"
+            labelFr    = "Developpement specifique"
+            legacyCode = "Developpement Specifique"
+        },
+        @{
+            code       = "NOC"
+            labelEn    = "Not Concerned"
+            labelFr    = "Non Concerne"
+            legacyCode = "Non Concerne"
+        },
+        @{
+            code       = "SFT"
+            labelEn    = "Software package"
+            labelFr    = "Progiciel"
+            legacyCode = "Progiciel"
+        },
+        @{
+            code       = "SPE"
+            labelEn    = "Service provided by external supplier"
+            labelFr    = "Service fourni par un prestataire externe"
+            legacyCode = "Service Prestataire Ext"
+        }
+    )
+}
+
+# ============================================================
+# DORA EXTRACTION
+# ============================================================
+
+function Get-DoraApplications {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Headers
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  PART 1: DORA APPLICATION EXTRACTION" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+
+    Write-Host ""
+    Write-Host "[DORA-1] Calling /count API..." -ForegroundColor Cyan
+
+    $bodyCount = New-DoraBaseSearchObject -PageNumber 1 -PageSize $script:PageSizeDORA
+
+    try {
+        $totalApps = Invoke-DoraApi `
+            -Uri "$($script:BaseUrlDORA)/api/application/count" `
+            -Method "POST" `
+            -Headers $Headers `
+            -Body $bodyCount
+
+        $totalAppsInt = [int]$totalApps
+        Write-Host "OK - Total number of DORA applications: $totalAppsInt" -ForegroundColor Green
+    }
+    catch {
+        Write-Error "ERROR while calling DORA /count: $_"
+        exit 1
+    }
+
+    Write-Host ""
+    Write-Host "[DORA-2] Retrieving all DORA applications..." -ForegroundColor Cyan
+
+    $totalPagesDORA = [Math]::Ceiling($totalAppsInt / $script:PageSizeDORA)
+    $allAppsDORA    = @()
+
+    Write-Host "Pages to retrieve: $totalPagesDORA (pageSize = $($script:PageSizeDORA))" -ForegroundColor White
+
+    for ($page = 1; $page -le $totalPagesDORA; $page++) {
+        Write-Host "  -> Page $page / $totalPagesDORA ..." -ForegroundColor Yellow
+
+        $bodySearch = New-DoraBaseSearchObject -PageNumber $page -PageSize $script:PageSizeDORA
+
+        try {
+            $pageData = Invoke-DoraApi `
+                -Uri "$($script:BaseUrlDORA)/api/application/search" `
+                -Method "POST" `
+                -Headers $Headers `
+                -Body $bodySearch
+
+            if ($pageData -is [Array])           { $allAppsDORA += $pageData }
+            elseif ($null -ne $pageData.results) { $allAppsDORA += $pageData.results }
+            else                                 { $allAppsDORA += $pageData }
+
+            Write-Host "    OK - $($allAppsDORA.Count) applications loaded so far." -ForegroundColor Green
+        }
+        catch {
+            Write-Warning "ERROR on DORA page $page : $_"
+            break
+        }
+    }
+
+    Write-Host ""
+    Write-Host "[DORA-3] Retrieving development natures..." -ForegroundColor Cyan
+
+    $appNaturesMap = @{}
+    $naturesConfig = Get-DoraNatureConfigurations
+
+    foreach ($nat in $naturesConfig) {
+        Write-Host "  -> Nature [$($nat.code)] $($nat.labelEn)..." -ForegroundColor Yellow
+
+        $bodyNature = New-DoraNatureSearchBody `
+            -NatureCode $nat.code `
+            -LabelEn $nat.labelEn `
+            -LabelFr $nat.labelFr `
+            -LegacyCode $nat.legacyCode
+
+        try {
+            $natData = Invoke-DoraApi `
+                -Uri "$($script:BaseUrlDORA)/api/application/search" `
+                -Method "POST" `
+                -Headers $Headers `
+                -Body $bodyNature
+
+            $natList = if ($natData -is [Array])           { $natData }
+                       elseif ($null -ne $natData.results) { $natData.results }
+                       else                                { $natData }
+
+            $count = 0
+            foreach ($app in $natList) {
+                $ciaKey = if ($app.cia) { $app.cia } else { $app.groupId }
+                if ([string]::IsNullOrWhiteSpace($ciaKey)) { continue }
+
+                if (-not $appNaturesMap.ContainsKey($ciaKey)) {
+                    $appNaturesMap[$ciaKey] = [System.Collections.Generic.List[object]]::new()
+                }
+
+                $appNaturesMap[$ciaKey].Add([PSCustomObject]@{
+                    code       = $nat.code
+                    labelEn    = $nat.labelEn
+                    labelFr    = $nat.labelFr
+                    legacyCode = $nat.legacyCode
+                })
+                $count++
+            }
+            Write-Host "     OK - $count application(s) found." -ForegroundColor Green
+        }
+        catch {
+            $script:Stats.Warnings++
+            Write-Warning "     WARNING - Error for [$($nat.code)] : $_"
+        }
+    }
+
+    $appsWithNature    = ($appNaturesMap.Keys | Measure-Object).Count
+    $appsWithoutNature = $allAppsDORA.Count - $appsWithNature
+
+    Write-Host ""
+    Write-Host "  Nature summary:" -ForegroundColor Cyan
+    Write-Host "  -> $appsWithNature with identified nature" -ForegroundColor White
+    Write-Host "  -> $appsWithoutNature without identified nature" -ForegroundColor White
+
+    Write-Host ""
+    Write-Host "[DORA-4] Merging DORA data + natures..." -ForegroundColor Cyan
+
+    $enrichedAppsDORA = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($app in $allAppsDORA) {
+        try {
+            $ciaKey = if ($app.cia) { $app.cia } else { $app.groupId }
+
+            if (-not [string]::IsNullOrWhiteSpace($ciaKey) -and $appNaturesMap.ContainsKey($ciaKey)) {
+                $naturesFound = $appNaturesMap[$ciaKey]
+                $codes        = ($naturesFound | ForEach-Object { $_.code }) -join " | "
+                $labelsEn     = ($naturesFound | ForEach-Object { $_.labelEn }) -join " | "
+                $labelsFr     = ($naturesFound | ForEach-Object { $_.labelFr }) -join " | "
+
+                $criteriaValue = [PSCustomObject]@{
+                    isCurrentVersion = $true
+                    natures          = $naturesFound
+                    hasNature        = $true
+                    natureSummary    = [PSCustomObject]@{
+                        codes    = $codes
+                        labelsEn = $labelsEn
+                        labelsFr = $labelsFr
+                    }
+                }
+            }
+            else {
+                $criteriaValue = [PSCustomObject]@{
+                    isCurrentVersion = $true
+                    natures          = @()
+                    hasNature        = $false
+                    natureSummary    = [PSCustomObject]@{
+                        codes    = ""
+                        labelsEn = "No development nature identified"
+                        labelsFr = "No development nature identified"
+                    }
+                }
+            }
+
+            $enrichedApp = $app | ConvertTo-Json -Depth 20 | ConvertFrom-Json
+            $enrichedApp | Add-Member -NotePropertyName "cia_key" -NotePropertyValue $ciaKey -Force
+            $enrichedApp | Add-Member -NotePropertyName "characteristicCriteria" -NotePropertyValue $criteriaValue -Force
+            $enrichedApp | Add-Member -NotePropertyName "extractionDate" -NotePropertyValue (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Force
+
+            $naFields = New-NaFields
+            foreach ($field in $naFields.Keys) {
+                $enrichedApp | Add-Member -NotePropertyName $field -NotePropertyValue $naFields[$field] -Force
+            }
+
+            $enrichedAppsDORA.Add($enrichedApp)
+        }
+        catch {
+            $script:Stats.ProcessingErrors++
+            Write-Warning "Unable to enrich a DORA application: $_"
+        }
+    }
+
+    Write-Host "OK - $($enrichedAppsDORA.Count) DORA applications enriched with nature data." -ForegroundColor Green
+
+    return [PSCustomObject]@{
+        TotalApps         = $totalAppsInt
+        AllApps           = $allAppsDORA
+        EnrichedApps      = $enrichedAppsDORA
+        AppsWithNature    = $appsWithNature
+        AppsWithoutNature = $appsWithoutNature
+        NaturesConfig     = $naturesConfig
+        NaturesMap        = $appNaturesMap
+    }
+}
+
+# ============================================================
+# DSO360 - GLOBAL SCANS
+# ============================================================
+
+function Get-Dso360Scans {
+    param(
+        [Parameter(Mandatory = $true)][hashtable]$Headers
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  PART 2: DSO360 GLOBAL SCAN EXTRACTION" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+
+    Write-Host ""
+    Write-Host "[DSO360-1] Global summary (scan/summary)..." -ForegroundColor Cyan
+
+    $dso360Summary = $null
+    try {
+        $dso360Summary = Invoke-Dso360Api `
+            -Uri "$($script:BaseUrlDSO360API)/dso-api/v1/sca/scan/summary" `
+            -Method "GET" `
+            -Headers $Headers
+
+        if ($null -ne $dso360Summary) {
+            Write-Host "OK - Global summary retrieved." -ForegroundColor Green
+            if ($null -ne $dso360Summary.scannedApps) {
+                Write-Host "     Scanned applications (global): $($dso360Summary.scannedApps)" -ForegroundColor Cyan
+            }
+        }
+    }
+    catch {
+        $script:Stats.Warnings++
+        Write-Warning "WARNING - Error retrieving DSO360 global summary: $_"
+    }
+
+    Write-Host ""
+    Write-Host "[DSO360-2] Retrieving scanned application list..." -ForegroundColor Cyan
+
+    $allScansDSO360 = @()
+    $dsoPage        = 0
+    $dsoTotalPages  = 1
+
+    do {
+        try {
+            Write-Host "  -> Page $($dsoPage + 1)..." -ForegroundColor Yellow
+
+            $uriScans = "{0}/dso-api/v1/sca/projects/scans?page={1}&size={2}" -f $script:BaseUrlDSO360API, $dsoPage, $script:PageSizeDSO360
+            $jsonData = Invoke-Dso360Api -Uri $uriScans -Method "GET" -Headers $Headers
+
+            if ($null -ne $jsonData) {
+                if ($jsonData.PSObject.Properties.Name -contains "content") {
+                    $apps          = $jsonData.content
+                    $dsoTotalPages = [int]$jsonData.totalPages
+                }
+                elseif ($jsonData -is [System.Array]) {
+                    $apps          = $jsonData
+                    $dsoTotalPages = 1
+                }
+                elseif ($jsonData.PSObject.Properties.Name -contains "applications") {
+                    $apps          = $jsonData.applications
+                    $dsoTotalPages = 1
+                }
+                else {
+                    $apps          = @($jsonData)
+                    $dsoTotalPages = 1
+                }
+
+                $allScansDSO360 += $apps
+                $countPage = if ($apps) { @($apps).Count } else { 0 }
+                Write-Host "    OK - Page $($dsoPage + 1)/$dsoTotalPages : $countPage item(s)." -ForegroundColor Green
+            }
+
+            $dsoPage++
+        }
+        catch {
+            $script:Stats.Warnings++
+            Write-Warning "WARNING - Error on DSO360 page $dsoPage : $_"
+            break
+        }
+    } while ($dsoPage -lt $dsoTotalPages)
+
+    Write-Host ""
+    Write-Host "OK - $($allScansDSO360.Count) DSO360 entries retrieved." -ForegroundColor Green
+
+    Write-Host ""
+    Write-Host "[DSO360-3] Building DSO360 lookup tables..." -ForegroundColor Cyan
+
+    $dso360MapByCia    = @{}
+    $dso360MapByName   = @{}
+    $dso360NameKeyList = New-Object System.Collections.Generic.List[string]
+
+    foreach ($scanEntry in $allScansDSO360) {
+        try {
+            $appName = Get-PropertyValue -Object $scanEntry -PropertyNames @("name","appName","project","applicationName")
+            if (-not $appName) { $appName = "N/A" }
+
+            $lastScan = Get-PropertyValue -Object $scanEntry -PropertyNames @("lastScan","lastScanDate","scanDate","updatedAt","last_scan_date")
+            if (-not $lastScan) { $lastScan = "N/A" }
+
+            $status = Get-PropertyValue -Object $scanEntry -PropertyNames @("status","scanStatus","state")
+            if (-not $status) { $status = "N/A" }
+
+            $nbModules = 0
+            if ($scanEntry.modules) {
+                $nbModules = @($scanEntry.modules).Count
+            }
+            elseif ($scanEntry.scans) {
+                $nbModules = @($scanEntry.scans).Count
+            }
+
+            $scanObj = [PSCustomObject]@{
+                CIA       = (Get-PropertyValue -Object $scanEntry -PropertyNames @("cia","CIA"))
+                AppName   = $appName
+                LastScan  = $lastScan
+                Status    = $status
+                NbModules = $nbModules
+                RawEntry  = $scanEntry
+            }
+
+            if ($scanObj.CIA -and -not [string]::IsNullOrWhiteSpace($scanObj.CIA)) {
+                $k = "$($scanObj.CIA)".Trim().ToUpperInvariant()
+                if (-not $dso360MapByCia.ContainsKey($k)) {
+                    $dso360MapByCia[$k] = $scanObj
+                }
+            }
+
+            if ($appName -ne "N/A") {
+                $k = Normalize-Text $appName
+                if (-not [string]::IsNullOrWhiteSpace($k)) {
+                    if (-not $dso360MapByName.ContainsKey($k)) {
+                        $dso360MapByName[$k] = $scanObj
+                        [void]$dso360NameKeyList.Add($k)
+                    }
+                }
+            }
+        }
+        catch {
+            $script:Stats.ProcessingErrors++
+        }
+    }
+
+    Write-Host "OK - CIA index  : $($dso360MapByCia.Count) entries." -ForegroundColor Green
+    Write-Host "     Name index : $($dso360MapByName.Count) entries." -ForegroundColor White
+
+    return [PSCustomObject]@{
+        Summary   = $dso360Summary
+        AllScans  = $allScansDSO360
+        MapByCia  = $dso360MapByCia
+        MapByName = $dso360MapByName
+        NameKeys  = $dso360NameKeyList
+    }
+}
+
+# ============================================================
+# MATCHING
+# ============================================================
+
+function Find-Dso360Match {
+    param(
+        [Parameter(Mandatory = $true)][object]$DoraApp,
+        [Parameter(Mandatory = $true)][hashtable]$MapByCia,
+        [Parameter(Mandatory = $true)][hashtable]$MapByName,
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[string]]$NameKeys
+    )
+
+    $ciaKey   = if ($DoraApp.cia_key) { "$($DoraApp.cia_key)".Trim().ToUpperInvariant() } else { "" }
+    $doraName = Get-ApplicationDisplayName -App $DoraApp
+    $nameKey  = Normalize-Text $doraName
+
+    if (-not [string]::IsNullOrWhiteSpace($ciaKey) -and $MapByCia.ContainsKey($ciaKey)) {
+        return [PSCustomObject]@{
+            Found     = $true
+            MatchType = "CIA"
+            Match     = $MapByCia[$ciaKey]
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($nameKey) -and $MapByName.ContainsKey($nameKey)) {
+        return [PSCustomObject]@{
+            Found     = $true
+            MatchType = "EXACT_NAME"
+            Match     = $MapByName[$nameKey]
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($nameKey)) {
+        foreach ($dsoKey in $NameKeys) {
+            if ($dsoKey -like "*$nameKey*" -or $nameKey -like "*$dsoKey*") {
+                return [PSCustomObject]@{
+                    Found     = $true
+                    MatchType = "PARTIAL_NAME"
+                    Match     = $MapByName[$dsoKey]
+                }
+            }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Found     = $false
+        MatchType = "NONE"
+        Match     = $null
+    }
+}
+
+# ============================================================
+# DSO360 MODULES
+# ============================================================
+
+function Get-ModuleList {
+    param($jsonData)
+    if (-not $jsonData) { return @() }
+    if ($jsonData.content -is [array] -and $jsonData.content.Count -gt 0) { return $jsonData.content }
+    elseif ($jsonData.modules -is [array] -and $jsonData.modules.Count -gt 0) { return $jsonData.modules }
+    elseif ($jsonData -is [array] -and $jsonData.Count -gt 0) { return $jsonData }
+    else { return @() }
+}
+
+function Get-LastScanDate {
+    param($module)
+    $candidates = @(
+        "lastScanDate","last_scan_date","lastScan",
+        "scanDate","scan_date","updatedAt",
+        "updated_at","dateLastScan","lastAnalysisDate"
+    )
+    foreach ($field in $candidates) {
+        $value = $module.$field
+        if ($null -ne $value -and $value -ne "") { return $value }
+    }
+    return "N/A"
+}
+
+function Get-ModuleName {
+    param($module)
+    if ($module.name)        { return $module.name }
+    if ($module.moduleName)  { return $module.moduleName }
+    if ($module.projectName) { return $module.projectName }
+    if ($module.id)          { return "ID:$($module.id)" }
+    return "Unknown"
+}
+
+function Get-Dso360ModulesByCia {
+    param(
+        [Parameter(Mandatory = $true)][string]$CIA,
+        [Parameter(Mandatory = $true)][hashtable]$Headers
+    )
+
+    $ciaNormalized = $CIA.Trim().ToUpperInvariant()
+    $uri = "{0}/dso-api/v1/sca/projects/scans/{1}?page=0&size={2}" -f $script:BaseUrlDSO360API, $ciaNormalized, $script:PageSizeModules
+
+    $bodyObject = @{
+        id         = 0
+        type       = $null
+        page       = 0
+        size       = [int]$script:PageSizeModules
+        filtersMap = @{}
+    }
+
+    try {
+        $jsonData = Invoke-Dso360Api `
+            -Uri $uri `
+            -Method "POST" `
+            -Headers $Headers `
+            -Body $bodyObject
+
+        $appNotFound = $false
+        if ($null -eq $jsonData) { $appNotFound = $true }
+        elseif ($jsonData.PSObject.Properties.Name -contains "error"   -and $jsonData.error   -match "not found") { $appNotFound = $true }
+        elseif ($jsonData.PSObject.Properties.Name -contains "message" -and $jsonData.message -match "not found") { $appNotFound = $true }
+        elseif ($jsonData.PSObject.Properties.Name -contains "status"  -and $jsonData.status  -eq 404)            { $appNotFound = $true }
+
+        if ($appNotFound) {
+            $script:Stats.ModulesNotFound++
+            return [PSCustomObject]@{
+                CIA            = $ciaNormalized
+                Status         = "Not found in DSO360"
+                HttpStatus     = 200
+                NombreModules  = 0
+                Modules        = @()
+                LastModuleScan = "N/A"
+                Message        = "Application not found in DSO360"
+                RawData        = $jsonData
+            }
+        }
+
+        $listeModules  = Get-ModuleList -jsonData $jsonData
+        $nombreModules = @($listeModules).Count
+
+        if ($nombreModules -eq 0) {
+            $script:Stats.ModulesEmpty++
+            return [PSCustomObject]@{
+                CIA            = $ciaNormalized
+                Status         = "No modules"
+                HttpStatus     = 200
+                NombreModules  = 0
+                Modules        = @()
+                LastModuleScan = "N/A"
+                Message        = "0 modules returned by DSO360"
+                RawData        = $jsonData
+            }
+        }
+
+        $modulesFormatted = @()
+        $lastScans = @()
+
+        foreach ($module in $listeModules) {
+            $moduleName = Get-ModuleName -module $module
+            $lastScan   = Get-LastScanDate -module $module
+            $status     = if ($module.status)  { $module.status }  else { "N/A" }
+            $version    = if ($module.version) { $module.version } else { "N/A" }
+
+            if ($lastScan -and $lastScan -ne "N/A") { $lastScans += $lastScan }
+
+            $modulesFormatted += [PSCustomObject]@{
+                Name                    = $moduleName
+                Version                 = $version
+                ScanStatus              = $status
+                DSO360_SCA_Module_Last  = $lastScan
+                RawData                 = $module
+            }
+        }
+
+        $script:Stats.ModulesSuccess++
+
+        return [PSCustomObject]@{
+            CIA            = $ciaNormalized
+            Status         = "Success"
+            HttpStatus     = 200
+            NombreModules  = $nombreModules
+            Modules        = $modulesFormatted
+            LastModuleScan = if ($lastScans.Count -gt 0) { ($lastScans | Select-Object -First 1) } else { "N/A" }
+            Message        = "Success"
+            RawData        = $jsonData
+        }
+    }
+    catch {
+        $script:Stats.ModuleApiErrors++
+
+        $statusCode   = $null
+        $errorMessage = $_.Exception.Message
+        $responseBody = $null
+
+        if ($_.Exception.Response) {
+            try {
+                $statusCode = [int]$_.Exception.Response.StatusCode
+            } catch {}
+
+            try {
+                $reader       = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $responseBody = $reader.ReadToEnd()
+                if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+                    $errorMessage = "HTTP code: $statusCode - Detail: $responseBody"
+                }
+            } catch {}
+        }
+
+        if ($statusCode -eq 404) {
+            $script:Stats.Modules404++
+            return [PSCustomObject]@{
+                CIA            = $ciaNormalized
+                Status         = "Not found in DSO360"
+                HttpStatus     = 404
+                NombreModules  = 0
+                Modules        = @()
+                LastModuleScan = "N/A"
+                Message        = "Application not found in DSO360 module SCA scans (HTTP 404)"
+                RawData        = $null
+            }
+        }
+
+        return [PSCustomObject]@{
+            CIA            = $ciaNormalized
+            Status         = "Error"
+            HttpStatus     = if ($statusCode) { $statusCode } else { "N/A" }
+            NombreModules  = 0
+            Modules        = @()
+            LastModuleScan = "N/A"
+            Message        = $errorMessage
+            RawData        = $responseBody
+        }
+    }
+}
+
+# ============================================================
+# CONSOLIDATION
+# ============================================================
+
+function Enrich-DoraApplicationsWithDso360 {
+    param(
+        [Parameter(Mandatory = $true)][System.Collections.Generic.List[object]]$Applications,
+        [Parameter(Mandatory = $true)][object]$DsoScans,
+        [Parameter(Mandatory = $true)][hashtable]$HeadersDSO360
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  PART 3: DSO360 ENRICHMENT (MATCH + MODULES)" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+
+    $matchedCount     = 0
+    $unmatchedCount   = 0
+    $devAppsCount     = 0
+    $nonDevCount      = 0
+    $totalModules     = 0
+    $successCount     = 0
+    $moduleCallErrors = 0
+    $totalApps        = $Applications.Count
+    $currentIndex     = 0
+
+    foreach ($doraApp in $Applications) {
+        $currentIndex++
+
+        try {
+            $ciaKey         = if ($doraApp.cia_key) { "$($doraApp.cia_key)".Trim().ToUpperInvariant() } else { "N/A" }
+            $applicationName = Get-ApplicationDisplayName -App $doraApp
+            if ([string]::IsNullOrWhiteSpace($applicationName)) { $applicationName = "Unknown application" }
+
+            $natureText = Get-ApplicationNatureText -App $doraApp
+            $isDev      = Test-IsSpecificDevelopment -App $doraApp
+
+            if (-not $isDev) {
+                $nonDevCount++
+
+                $doraApp.DSO360_ScanExist             = "N/A"
+                $doraApp.DSO360_Matched               = "N/A"
+                $doraApp.DSO360_MatchType             = "N/A"
+                $doraApp.DSO360_AppName               = "N/A"
+                $doraApp.DSO360_ScanStatus            = "N/A"
+                $doraApp.DSO360_SCA_Globale_LastScan  = "N/A"
+                $doraApp.NB_Modules                   = "N/A"
+                $doraApp.Liste_Modules                = "N/A"
+                $doraApp.DSO360_SCA_Module_Last       = "N/A"
+                $doraApp.DSO360_Modules_Detail        = "N/A"
+                $doraApp.DSO360_Modules_Status        = "N/A"
+                $doraApp.DSO360_ModuleFetchStatus     = "N/A"
+                $doraApp.DSO360_ModuleFetchMessage    = "N/A"
+
+                Write-AppProcessingStatus `
+                    -Current $currentIndex `
+                    -Total $totalApps `
+                    -CIA $ciaKey `
+                    -ApplicationName $applicationName `
+                    -Nature $natureText `
+                    -Status "NOT APPLICABLE"
+
+                continue
+            }
+
+            $devAppsCount++
+
+            $matchResult = Find-Dso360Match `
+                -DoraApp $doraApp `
+                -MapByCia $DsoScans.MapByCia `
+                -MapByName $DsoScans.MapByName `
+                -NameKeys $DsoScans.NameKeys
+
+            if ($matchResult.Found) {
+                $matchedCount++
+                $successCount++
+                $doraApp.DSO360_ScanExist             = "Yes"
+                $doraApp.DSO360_Matched               = $true
+                $doraApp.DSO360_MatchType             = $matchResult.MatchType
+                $doraApp.DSO360_AppName               = $matchResult.Match.AppName
+                $doraApp.DSO360_ScanStatus            = $matchResult.Match.Status
+                $doraApp.DSO360_SCA_Globale_LastScan  = $matchResult.Match.LastScan
+                $doraApp.DSO360_RawEntry              = $matchResult.Match.RawEntry
+
+                switch ($matchResult.MatchType) {
+                    "CIA"          { $script:Stats.MatchingByCIA++ }
+                    "EXACT_NAME"   { $script:Stats.MatchingByExactName++ }
+                    "PARTIAL_NAME" { $script:Stats.MatchingByPartialName++ }
+                }
+
+                Write-AppProcessingStatus `
+                    -Current $currentIndex `
+                    -Total $totalApps `
+                    -CIA $ciaKey `
+                    -ApplicationName $applicationName `
+                    -Nature $natureText `
+                    -Status "MATCH"
+            }
+            else {
+                $unmatchedCount++
+                $doraApp.DSO360_ScanExist             = "No"
+                $doraApp.DSO360_Matched               = $false
+                $doraApp.DSO360_MatchType             = "NONE"
+                $doraApp.DSO360_AppName               = "N/A"
+                $doraApp.DSO360_ScanStatus            = "N/A"
+                $doraApp.DSO360_SCA_Globale_LastScan  = "N/A"
+                $doraApp.DSO360_RawEntry              = $null
+                $script:Stats.MatchingNone++
+
+                Write-AppProcessingStatus `
+                    -Current $currentIndex `
+                    -Total $totalApps `
+                    -CIA $ciaKey `
+                    -ApplicationName $applicationName `
+                    -Nature $natureText `
+                    -Status "NO MATCH"
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($ciaKey) -and $ciaKey -ne "N/A") {
+                $moduleResult = Get-Dso360ModulesByCia -CIA $ciaKey -Headers $HeadersDSO360
+
+                $doraApp.DSO360_Modules_Status      = $moduleResult.Status
+                $doraApp.DSO360_ModuleFetchStatus   = $moduleResult.Status
+                $doraApp.DSO360_ModuleFetchMessage  = $moduleResult.Message
+                $doraApp.DSO360_Modules_Raw         = $moduleResult.RawData
+
+                if ($moduleResult.Status -eq "Success") {
+                    $doraApp.NB_Modules             = $moduleResult.NombreModules
+                    $doraApp.DSO360_Modules_Detail  = $moduleResult.Modules
+                    $doraApp.DSO360_SCA_Module_Last = $moduleResult.LastModuleScan
+                    $doraApp.Liste_Modules          = @($moduleResult.Modules | ForEach-Object {
+                        if ($_.Version -and $_.Version -ne "N/A") {
+                            "$($_.Name) [$($_.Version)]"
+                        } else {
+                            "$($_.Name)"
+                        }
+                    })
+                    $totalModules += [int]$moduleResult.NombreModules
+                }
+                elseif ($moduleResult.Status -eq "Not found in DSO360" -or $moduleResult.Status -eq "No modules") {
+                    $doraApp.NB_Modules             = 0
+                    $doraApp.Liste_Modules          = @()
+                    $doraApp.DSO360_SCA_Module_Last = "N/A"
+                    $doraApp.DSO360_Modules_Detail  = @()
+                }
+                else {
+                    $moduleCallErrors++
+                    $doraApp.NB_Modules             = 0
+                    $doraApp.Liste_Modules          = @()
+                    $doraApp.DSO360_SCA_Module_Last = "N/A"
+                    $doraApp.DSO360_Modules_Detail  = @()
+                }
+            }
+            else {
+                $doraApp.DSO360_Modules_Status      = "Error"
+                $doraApp.DSO360_ModuleFetchStatus   = "Error"
+                $doraApp.DSO360_ModuleFetchMessage  = "CIA is missing, unable to query DSO360 modules"
+                $doraApp.NB_Modules                 = 0
+                $doraApp.Liste_Modules              = @()
+                $doraApp.DSO360_SCA_Module_Last     = "N/A"
+                $doraApp.DSO360_Modules_Detail      = @()
+                $moduleCallErrors++
+            }
+        }
+        catch {
+            $script:Stats.ProcessingErrors++
+            $moduleCallErrors++
+            Write-Warning "Error while processing one application: $_"
+        }
+    }
+
+    Write-Host ""
+    Write-Host "  Enrichment summary:" -ForegroundColor Cyan
+    Write-Host "  -> Total DORA applications            : $($Applications.Count)" -ForegroundColor White
+    Write-Host "  -> 'Specific development' applications: $devAppsCount" -ForegroundColor White
+    Write-Host "  -> Non-DEV applications               : $nonDevCount" -ForegroundColor White
+    Write-Host "  -> DEV with DSO360 scan match         : $matchedCount" -ForegroundColor Green
+    Write-Host "  -> DEV without DSO360 scan match      : $unmatchedCount" -ForegroundColor Red
+    Write-Host "  -> Total DSO360 modules               : $totalModules" -ForegroundColor Cyan
+
+    return [PSCustomObject]@{
+        Applications      = $Applications
+        MatchedCount      = $matchedCount
+        UnmatchedCount    = $unmatchedCount
+        DevAppsCount      = $devAppsCount
+        NonDevCount       = $nonDevCount
+        TotalModules      = $totalModules
+        SuccessCount      = $successCount
+        ModuleCallErrors  = $moduleCallErrors
+    }
+}
+
+# ============================================================
+# METADATA
+# ============================================================
+
+function Build-ExecutionMetadata {
+    param(
+        [Parameter(Mandatory = $true)][object]$DoraData,
+        [Parameter(Mandatory = $true)][object]$DsoData,
+        [Parameter(Mandatory = $true)][object]$Consolidation
+    )
+
+    $detailByNature = @()
+    foreach ($nat in $DoraData.NaturesConfig) {
+        $nb = ($Consolidation.Applications | Where-Object {
+            $_.characteristicCriteria.natures -and
+            ($_.characteristicCriteria.natures | Where-Object { $_.code -eq $nat.code }).Count -gt 0
+        }).Count
+
+        $detailByNature += [PSCustomObject]@{
+            code       = $nat.code
+            labelEn    = $nat.labelEn
+            labelFr    = $nat.labelFr
+            legacyCode = $nat.legacyCode
+            count      = $nb
+        }
+    }
+
+    $coverageRate = 0
+    if ($Consolidation.DevAppsCount -gt 0) {
+        $coverageRate = [Math]::Round((($Consolidation.MatchedCount / $Consolidation.DevAppsCount) * 100), 2)
+    }
+
+    $totalErrors = `
+        $script:Stats.DoraApiErrors + `
+        $script:Stats.DsoApiErrors + `
+        $script:Stats.ModuleApiErrors + `
+        $script:Stats.ProcessingErrors
+
+    return [PSCustomObject]@{
+        ExecutionDate                     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+        ScriptVersion                     = "2.2"
+        MainPivotKey                      = "cia"
+        Description                       = "Complete DORA extraction enriched with DSO360 SCA scans and modules"
+        OutputFile                        = $script:OutputPathJSON
+        TotalDoraApplications             = $Consolidation.Applications.Count
+        DevApplications                   = $Consolidation.DevAppsCount
+        NonDevApplications                = $Consolidation.NonDevCount
+        TotalDso360Scans                  = $DsoData.AllScans.Count
+        ScansFound                        = $Consolidation.MatchedCount
+        ScansNotFound                     = $Consolidation.UnmatchedCount
+        CoverageRatePercent               = $coverageRate
+        MatchingSuccessRatePercent        = $coverageRate
+        MatchingByCIA                     = $script:Stats.MatchingByCIA
+        MatchingByExactName               = $script:Stats.MatchingByExactName
+        MatchingByPartialName             = $script:Stats.MatchingByPartialName
+        MatchingWithoutResult             = $script:Stats.MatchingNone
+        ApplicationsWithNature            = $DoraData.AppsWithNature
+        ApplicationsWithoutNature         = $DoraData.AppsWithoutNature
+        StatisticsByCharacteristicCriteria= $detailByNature
+        TotalModules                      = $Consolidation.TotalModules
+        ErrorAnomalyCount                 = $totalErrors
+        WarningCount                      = $script:Stats.Warnings
+        DoraApiErrors                     = $script:Stats.DoraApiErrors
+        DsoApiErrors                      = $script:Stats.DsoApiErrors
+        ModuleApiErrors                   = $script:Stats.ModuleApiErrors
+        ProcessingErrors                  = $script:Stats.ProcessingErrors
+        Dso360Summary                     = $DsoData.Summary
+    }
+}
+
+# ============================================================
+# FINAL REPORT
+# ============================================================
+
+function Show-ExecutionReport {
+    param(
+        [Parameter(Mandatory = $true)][object]$Metadata,
+        [Parameter(Mandatory = $true)][string]$OutputPath
+    )
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Magenta
+    Write-Host "  FINAL EXECUTION REPORT" -ForegroundColor Magenta
+    Write-Host "============================================================" -ForegroundColor Magenta
+
+    $globalStatus = if ($Metadata.ErrorAnomalyCount -gt 0) { "COMPLETED WITH ANOMALIES" } else { "SUCCESS" }
+    $globalColor  = if ($Metadata.ErrorAnomalyCount -gt 0) { "Yellow" } else { "Green" }
+
+    Write-Host "  Global status                        : $globalStatus" -ForegroundColor $globalColor
+    Write-Host "  Applications processed               : $($Metadata.TotalDoraApplications)" -ForegroundColor White
+    Write-Host "  DEV applications                     : $($Metadata.DevApplications)" -ForegroundColor White
+    Write-Host "  Non-DEV applications                 : $($Metadata.NonDevApplications)" -ForegroundColor White
+    Write-Host "  Scans found                          : $($Metadata.ScansFound)" -ForegroundColor Green
+    Write-Host "  Not found in DSO360                  : $($Metadata.ScansNotFound)" -ForegroundColor Red
+    Write-Host "  Errors / anomalies                   : $($Metadata.ErrorAnomalyCount)" -ForegroundColor Red
+    Write-Host "  Total modules                        : $($Metadata.TotalModules)" -ForegroundColor Cyan
+    Write-Host "  Coverage rate                        : $($Metadata.CoverageRatePercent) %" -ForegroundColor Cyan
+    Write-Host "  Output file                          : $OutputPath" -ForegroundColor Green
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Magenta
+}
+
+# ============================================================
+# STARTUP BANNER
+# ============================================================
+Clear-Host
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host "  FINAL UNIFIED SCRIPT: DORA x DSO360 - Security KPI Extract" -ForegroundColor Magenta
+Write-Host "  Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')" -ForegroundColor Magenta
+Write-Host "============================================================" -ForegroundColor Magenta
+Write-Host ""
+
+# ============================================================
+# AUTHENTICATION
+# ============================================================
+
+$instructionsDORA = @"
+Steps to retrieve the DORA token:
+  1. Sign in to REFA
+  2. Open developer tools (F12) > Network tab
+  3. Perform an action (application search)
+  4. Click an API request > Headers > Authorization
+  5. Copy the full value (Bearer eyJ...)
+"@
+
+$instructionsDSO360 = @"
+Steps to retrieve the DSO360 token:
+  1. Sign in to DSO360
+  2. Open developer tools (F12) > Network tab
+  3. Refresh the page or perform an action
+  4. Filter requests on 'dso-api'
+  5. Click a request > Headers > Authorization
+  6. Copy the full value (Bearer eyJ...)
+"@
+
+$tokenDORA = Get-BearerToken `
+    -SystemName "DORA (REFA)" `
+    -SystemUrl $script:BaseUrlDORA `
+    -Instructions $instructionsDORA
+
+$tokenDSO360 = Get-BearerToken `
+    -SystemName "DSO360" `
+    -SystemUrl $script:BaseUrlDSO360 `
+    -Instructions $instructionsDSO360
+
+$headersDORA   = New-DoraHeaders -Token $tokenDORA
+$headersDSO360 = New-Dso360Headers -Token $tokenDSO360
+
+Write-Host ""
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host " Both tokens accepted. Starting processing..." -ForegroundColor Green
+Write-Host "============================================================" -ForegroundColor Green
+Write-Host ""
+
+# ============================================================
+# MAIN EXECUTION
+# ============================================================
+
+try {
+    $doraData = Get-DoraApplications -Headers $headersDORA
+    $dsoData  = Get-Dso360Scans -Headers $headersDSO360
+
+    $consolidation = Enrich-DoraApplicationsWithDso360 `
+        -Applications $doraData.EnrichedApps `
+        -DsoScans $dsoData `
+        -HeadersDSO360 $headersDSO360
+
+    $metadata = Build-ExecutionMetadata `
+        -DoraData $doraData `
+        -DsoData $dsoData `
+        -Consolidation $consolidation
+
+    $globalOutput = [PSCustomObject]@{
+        Metadata = $metadata
+        Data     = $consolidation.Applications
+    }
+
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Cyan
+    Write-Host "  PART 4: SAVING CONSOLIDATED JSON FILE" -ForegroundColor Cyan
+    Write-Host "============================================================" -ForegroundColor Cyan
+
+    Save-JsonUTF8 -FilePath $script:OutputPathJSON -Data $globalOutput
+
+    $resolvedOutput = try { (Resolve-Path $script:OutputPathJSON).Path } catch { $script:OutputPathJSON }
+
+    Write-Host ""
+    Write-Host "OK - Consolidated JSON file saved:" -ForegroundColor Green
+    Write-Host "     $resolvedOutput" -ForegroundColor White
+    Write-Host "     Size      : $([math]::Round((Get-Item $script:OutputPathJSON).Length / 1KB, 2)) KB" -ForegroundColor White
+    Write-Host "     Encoding  : UTF-8 without BOM" -ForegroundColor White
+    Write-Host "     Applications: $($consolidation.Applications.Count)" -ForegroundColor White
+
+    Show-ExecutionReport -Metadata $metadata -OutputPath $resolvedOutput
+}
+catch {
+    Write-Host ""
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "  SCRIPT FAILURE" -ForegroundColor Red
+    Write-Host "============================================================" -ForegroundColor Red
+    Write-Host "Error: $_" -ForegroundColor Red
+    exit 1
+}
