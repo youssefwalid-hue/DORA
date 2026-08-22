@@ -1,4 +1,3 @@
-# IMPORTANT: save this .ps1 file as UTF-8 with BOM for Windows PowerShell 5.x.
 <#
 .SYNOPSIS
 Extracts DORA applications and enriches them with DSO360 SCA and Checkmarx SAST coverage data.
@@ -25,20 +24,10 @@ The script produces:
 #   - Replaced "DORA (REFA)" display label by "REFA"
 # ============================================================
 
-$script:Utf8NoBom       = New-Object System.Text.UTF8Encoding($false)
-$script:Utf8Bom         = New-Object System.Text.UTF8Encoding($true)
-$script:Utf8StrictNoBom = New-Object System.Text.UTF8Encoding($false, $true)
-$OutputEncoding         = $script:Utf8NoBom
-
 try {
-    [Console]::InputEncoding = $script:Utf8NoBom
-} catch {}
-
-try {
-    [Console]::OutputEncoding = $script:Utf8NoBom
-} catch {}
-
-try {
+    [Console]::InputEncoding  = [System.Text.Encoding]::UTF8
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding           = [System.Text.Encoding]::UTF8
     chcp 65001 | Out-Null
 } catch {}
 
@@ -55,7 +44,7 @@ try {
 $script:Session = New-Object Microsoft.PowerShell.Commands.WebRequestSession
 $script:Session.UserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
 
-$script:ContentType = "application/json; charset=utf-8"
+$script:ContentType = "application/json"
 
 $script:BaseUrlDORA          = "https://refa-group.d.bbg"
 $script:BaseUrlDORAFallbacks = @(
@@ -103,6 +92,9 @@ $script:OutputPathJSON            = ".\DETAILED_DATA_EXTRACT_SCA_KPI_${script:Da
 $script:OutputPathCSV             = ".\DETAILED_DATA_EXTRACT_SCA_KPI_${script:DateDay}_${script:Timestamp}.csv"
 $script:LogPath                   = ".\DETAILED_DATA_EXTRACT_SCA_KPI_${script:DateDay}_${script:Timestamp}.log"
 
+$script:Utf8NoBom                 = New-Object System.Text.UTF8Encoding($false)
+$script:Utf8Bom                   = New-Object System.Text.UTF8Encoding($true)
+
 $script:ScaByCiaCache  = @{}
 $script:SastByCiaCache = @{}
 
@@ -144,231 +136,6 @@ $script:Stats = [ordered]@{
 # LOGGING / FILE HELPERS
 # ============================================================
 
-function Get-MojibakeScore {
-    param([AllowNull()][string]$Text)
-
-    if ([string]::IsNullOrEmpty($Text)) { return 0 }
-
-    $patterns = @(
-        'Ã[\u0080-\u00BF\u0152\u0153\u0160\u0161\u0178\u017D\u017E\u0192\u02C6\u02DC\u2013\u2014\u2018\u2019\u201A\u201C\u201D\u201E\u2020\u2021\u2022\u2026\u2030\u2039\u203A\u20AC\u2122]',
-        'Â(?:[\u0080-\u00BF]|\s)',
-        'â(?:[\u0080-\u00BF\u0152\u0153\u0160\u0161\u0178\u017D\u017E\u0192\u02C6\u02DC\u2013\u2014\u2018\u2019\u201A\u201C\u201D\u201E\u2020\u2021\u2022\u2026\u2030\u2039\u203A\u20AC\u2122]){1,2}',
-        'ï»¿',
-        'ðŸ'
-    )
-
-    $score = 0
-    foreach ($pattern in $patterns) {
-        $score += [System.Text.RegularExpressions.Regex]::Matches($Text, $pattern).Count
-    }
-
-    return $score
-}
-
-function Repair-MojibakeString {
-    param([AllowNull()][string]$Text)
-
-    if ([string]::IsNullOrEmpty($Text)) { return $Text }
-
-    $current = $Text
-
-    for ($pass = 0; $pass -lt 3; $pass++) {
-        $currentScore = Get-MojibakeScore -Text $current
-        if ($currentScore -eq 0) { break }
-
-        $repairedThisPass = $false
-
-        foreach ($sourceCodePage in @(1252, 28591)) {
-            try {
-                $sourceEncoding = [System.Text.Encoding]::GetEncoding(
-                    $sourceCodePage,
-                    [System.Text.EncoderFallback]::ExceptionFallback,
-                    [System.Text.DecoderFallback]::ExceptionFallback
-                )
-                $candidateBytes = $sourceEncoding.GetBytes($current)
-                $candidate = $script:Utf8StrictNoBom.GetString($candidateBytes)
-                $candidateScore = Get-MojibakeScore -Text $candidate
-
-                if ($candidateScore -lt $currentScore) {
-                    $current = $candidate
-                    $repairedThisPass = $true
-                    break
-                }
-            }
-            catch {}
-        }
-
-        if ($repairedThisPass) { continue }
-
-        break
-    }
-
-    $knownFragments = [ordered]@{
-        "â€™" = "’"
-        "â€˜" = "‘"
-        "â€œ" = "“"
-        "â€" = "”"
-        "â€“" = "–"
-        "â€”" = "—"
-        "â€¦" = "…"
-        "â€¢" = "•"
-        "â€ž" = "„"
-        "â€š" = "‚"
-    }
-
-    foreach ($fragment in $knownFragments.Keys) {
-        $current = $current.Replace($fragment, $knownFragments[$fragment])
-    }
-
-    $current = $current.Replace("â€", '"')
-
-    return $current
-}
-
-function Repair-MojibakeObject {
-    param([AllowNull()]$InputObject)
-
-    if ($null -eq $InputObject) { return $null }
-
-    if ($InputObject -is [string]) {
-        return (Repair-MojibakeString -Text $InputObject)
-    }
-
-    if ($InputObject -is [System.Collections.IDictionary]) {
-        foreach ($key in @($InputObject.Keys)) {
-            $InputObject[$key] = Repair-MojibakeObject -InputObject $InputObject[$key]
-        }
-        return $InputObject
-    }
-
-    if ($InputObject -is [System.Collections.IList]) {
-        for ($index = 0; $index -lt $InputObject.Count; $index++) {
-            $InputObject[$index] = Repair-MojibakeObject -InputObject $InputObject[$index]
-        }
-        return $InputObject
-    }
-
-    if ($InputObject -is [System.Management.Automation.PSCustomObject]) {
-        foreach ($property in @($InputObject.PSObject.Properties)) {
-            try {
-                $property.Value = Repair-MojibakeObject -InputObject $property.Value
-            }
-            catch {
-                # Encoding-only safeguard: leave read-only or ambiguous properties unchanged.
-            }
-        }
-        return $InputObject
-    }
-
-    return $InputObject
-}
-
-function ConvertFrom-JsonUtf8Text {
-    param([Parameter(Mandatory = $true)][string]$JsonText)
-
-    $cleanJson = $JsonText.TrimStart([char]0xFEFF)
-    $data = $cleanJson | ConvertFrom-Json
-    return (Repair-MojibakeObject -InputObject $data)
-}
-
-function Get-CharsetEncoding {
-    param([AllowNull()][string]$ContentType)
-
-    if ([string]::IsNullOrWhiteSpace($ContentType)) { return $null }
-
-    $match = [System.Text.RegularExpressions.Regex]::Match(
-        $ContentType,
-        'charset\s*=\s*["'']?([^;"''\s]+)',
-        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase
-    )
-
-    if (-not $match.Success) { return $null }
-
-    try {
-        return [System.Text.Encoding]::GetEncoding($match.Groups[1].Value.Trim())
-    }
-    catch {
-        return $null
-    }
-}
-
-function Convert-HttpBytesToText {
-    param(
-        [Parameter(Mandatory = $true)][byte[]]$Bytes,
-        [AllowNull()][string]$ContentType
-    )
-
-    if ($Bytes.Length -eq 0) { return "" }
-
-    if ($Bytes.Length -ge 3 -and $Bytes[0] -eq 0xEF -and $Bytes[1] -eq 0xBB -and $Bytes[2] -eq 0xBF) {
-        return (Repair-MojibakeString -Text $script:Utf8NoBom.GetString($Bytes, 3, $Bytes.Length - 3))
-    }
-
-    $declaredEncoding = Get-CharsetEncoding -ContentType $ContentType
-    $utf8Text = $null
-    $utf8IsValid = $false
-
-    try {
-        $utf8Text = $script:Utf8StrictNoBom.GetString($Bytes)
-        $utf8IsValid = $true
-    }
-    catch {}
-
-    if ($utf8IsValid -and $ContentType -match '(?i)application/(?:[^;]+\+)?json') {
-        return (Repair-MojibakeString -Text $utf8Text.TrimStart([char]0xFEFF))
-    }
-
-    if ($null -ne $declaredEncoding) {
-        try {
-            $declaredText = $declaredEncoding.GetString($Bytes)
-
-            if ($declaredEncoding.WebName -match '^utf-?8$') {
-                return (Repair-MojibakeString -Text $declaredText.TrimStart([char]0xFEFF))
-            }
-
-            if ($utf8IsValid -and (Get-MojibakeScore -Text $declaredText) -gt (Get-MojibakeScore -Text $utf8Text)) {
-                return (Repair-MojibakeString -Text $utf8Text.TrimStart([char]0xFEFF))
-            }
-
-            return (Repair-MojibakeString -Text $declaredText.TrimStart([char]0xFEFF))
-        }
-        catch {}
-    }
-
-    if ($utf8IsValid) {
-        return (Repair-MojibakeString -Text $utf8Text.TrimStart([char]0xFEFF))
-    }
-
-    $windows1252 = [System.Text.Encoding]::GetEncoding(1252)
-    return (Repair-MojibakeString -Text $windows1252.GetString($Bytes))
-}
-
-function Get-WebResponseText {
-    param([Parameter(Mandatory = $true)]$Response)
-
-    $contentType = $null
-    try { $contentType = [string]$Response.Headers['Content-Type'] } catch {}
-
-    try {
-        if ($null -ne $Response.RawContentStream) {
-            $stream = $Response.RawContentStream
-            if ($stream.CanSeek) { $stream.Position = 0 }
-
-            $memory = New-Object System.IO.MemoryStream
-            try {
-                $stream.CopyTo($memory)
-                return (Convert-HttpBytesToText -Bytes $memory.ToArray() -ContentType $contentType)
-            }
-            finally {
-                $memory.Dispose()
-            }
-        }
-    }
-    catch {}
-
-    return (Repair-MojibakeString -Text ([string]$Response.Content))
-}
-
 function Resolve-SafePath {
     param([Parameter(Mandatory = $true)][string]$Path)
 
@@ -394,12 +161,11 @@ function Write-TextFileUtf8 {
 
     $resolvedPath = Resolve-SafePath -Path $FilePath
     $encoding = if ($WithBom) { $script:Utf8Bom } else { $script:Utf8NoBom }
-    $safeContent = Repair-MojibakeString -Text $Content
 
     if ($Append -and (Test-Path $resolvedPath)) {
-        [System.IO.File]::AppendAllText($resolvedPath, $safeContent, $encoding)
+        [System.IO.File]::AppendAllText($resolvedPath, $Content, $encoding)
     } else {
-        [System.IO.File]::WriteAllText($resolvedPath, $safeContent, $encoding)
+        [System.IO.File]::WriteAllText($resolvedPath, $Content, $encoding)
     }
 }
 
@@ -413,12 +179,6 @@ function Add-ExecutionEvent {
         [string]$System = "",
         [string]$Context = ""
     )
-
-    $Step     = Repair-MojibakeString -Text $Step
-    $Message  = Repair-MojibakeString -Text $Message
-    $Endpoint = Repair-MojibakeString -Text $Endpoint
-    $System   = Repair-MojibakeString -Text $System
-    $Context  = Repair-MojibakeString -Text $Context
 
     $event = [PSCustomObject]@{
         Timestamp = (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")
@@ -455,7 +215,7 @@ function Initialize-LogFile {
     $header += "============================================================"
     $header += ""
 
-    Write-TextFileUtf8 -FilePath $script:LogPath -Content (($header -join [Environment]::NewLine) + [Environment]::NewLine) -WithBom
+    Write-TextFileUtf8 -FilePath $script:LogPath -Content (($header -join [Environment]::NewLine) + [Environment]::NewLine)
 }
 
 function Save-JsonUTF8 {
@@ -464,9 +224,8 @@ function Save-JsonUTF8 {
         [Parameter(Mandatory = $true)][object]$Data
     )
 
-    $cleanData = Repair-MojibakeObject -InputObject $Data
-    $json = $cleanData | ConvertTo-Json -Depth 60
-    Write-TextFileUtf8 -FilePath $FilePath -Content $json -WithBom
+    $json = $Data | ConvertTo-Json -Depth 60
+    Write-TextFileUtf8 -FilePath $FilePath -Content $json
 }
 
 function Export-CsvUtf8ExcelCompatible {
@@ -482,8 +241,7 @@ function Export-CsvUtf8ExcelCompatible {
     }
 
     if ($UseBomForExcel) {
-        $csv = $Rows | ConvertTo-Csv -NoTypeInformation
-        Write-TextFileUtf8 -FilePath $resolvedPath -Content (($csv -join [Environment]::NewLine) + [Environment]::NewLine) -WithBom
+        $Rows | Export-Csv -Path $resolvedPath -NoTypeInformation -Encoding UTF8
     } else {
         $csv = $Rows | ConvertTo-Csv -NoTypeInformation
         Write-TextFileUtf8 -FilePath $resolvedPath -Content (($csv -join [Environment]::NewLine) + [Environment]::NewLine)
@@ -944,8 +702,8 @@ function Decode-JWTInfo {
         $payload = $parts[1]
         $padded  = $payload.PadRight($payload.Length + (4 - $payload.Length % 4) % 4, "=")
         $padded  = $padded -replace "-", "+" -replace "_", "/"
-        $decoded = $script:Utf8StrictNoBom.GetString([System.Convert]::FromBase64String($padded))
-        return (ConvertFrom-JsonUtf8Text -JsonText $decoded)
+        $decoded = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($padded))
+        return $decoded | ConvertFrom-Json
     }
     catch {
         return $null
@@ -1019,17 +777,10 @@ function Get-HttpResponseBodyFromError {
         if ($null -ne $ErrorRecord.Exception.Response) {
             $stream = $ErrorRecord.Exception.Response.GetResponseStream()
             if ($null -ne $stream) {
-                $contentType = $null
-                try { $contentType = [string]$ErrorRecord.Exception.Response.ContentType } catch {}
-
-                $memory = New-Object System.IO.MemoryStream
-                try {
-                    $stream.CopyTo($memory)
-                    return (Convert-HttpBytesToText -Bytes $memory.ToArray() -ContentType $contentType)
-                }
-                finally {
-                    $memory.Dispose()
-                }
+                $reader = New-Object System.IO.StreamReader($stream, [System.Text.Encoding]::UTF8, $true)
+                $body = $reader.ReadToEnd()
+                $reader.Dispose()
+                return $body
             }
         }
     } catch {}
@@ -1094,8 +845,7 @@ function Invoke-ApiRequest {
                 if ($Method -eq "POST") {
                     $invokeParams["ContentType"] = $script:ContentType
                     if ($null -ne $Body) {
-                        $jsonBody = $Body | ConvertTo-Json -Depth 30 -Compress
-                        $invokeParams["Body"] = $script:Utf8NoBom.GetBytes($jsonBody)
+                        $invokeParams["Body"] = ($Body | ConvertTo-Json -Depth 30 -Compress)
                     }
                 }
 
@@ -1104,9 +854,25 @@ function Invoke-ApiRequest {
                 }
 
                 $response = Invoke-WebRequest @invokeParams
-                $responseText = Get-WebResponseText -Response $response
-                if (-not [string]::IsNullOrWhiteSpace($responseText)) {
-                    return (ConvertFrom-JsonUtf8Text -JsonText $responseText)
+
+                # Fix: Invoke-WebRequest (PowerShell 5.x) decodes .Content by guessing the
+                # charset from the response headers, defaulting to Latin-1/Windows-1252 when
+                # the API does not explicitly send "charset=utf-8". This is the root cause of
+                # mojibake (Ã©, Ã¨, Ãª, Ã§, ...) in downstream JSON/CSV/log output. We read the
+                # raw response bytes and decode them explicitly as UTF-8, with a fallback to
+                # the original behavior if RawContentStream is unavailable.
+                $rawResponseBytes = $null
+                try { $rawResponseBytes = $response.RawContentStream.ToArray() } catch { $rawResponseBytes = $null }
+
+                if ($rawResponseBytes -and $rawResponseBytes.Length -gt 0) {
+                    $rawResponseText = [System.Text.Encoding]::UTF8.GetString($rawResponseBytes)
+                    if ($rawResponseText) {
+                        return ($rawResponseText | ConvertFrom-Json)
+                    }
+                }
+
+                if ($response.Content) {
+                    return ($response.Content | ConvertFrom-Json)
                 }
                 return $null
             }
@@ -1422,7 +1188,7 @@ function New-DoraHeaders {
     return @{
         "Authorization" = "Bearer $Token"
         "Accept"        = "application/json, text/plain, */*"
-        "Content-Type"  = "application/json; charset=utf-8"
+        "Content-Type"  = "application/json"
         "Referer"       = "$($script:BaseUrlDORA)/"
         "Origin"        = $script:BaseUrlDORA
         "Language"      = "en"
@@ -2050,8 +1816,7 @@ function Get-DoraApplications {
                 }
             }
 
-            $enrichedAppJson = $app | ConvertTo-Json -Depth 20
-            $enrichedApp = ConvertFrom-JsonUtf8Text -JsonText $enrichedAppJson
+            $enrichedApp = $app | ConvertTo-Json -Depth 20 | ConvertFrom-Json
             $enrichedApp | Add-Member -NotePropertyName "cia_key" -NotePropertyValue $ciaKey -Force
             $enrichedApp | Add-Member -NotePropertyName "characteristicCriteria" -NotePropertyValue $criteriaValue -Force
             $enrichedApp | Add-Member -NotePropertyName "extractionDate" -NotePropertyValue (Get-Date -Format "yyyy-MM-dd HH:mm:ss") -Force
@@ -3364,7 +3129,7 @@ try {
     Write-Host "     JSON size : $([math]::Round((Get-Item $script:OutputPathJSON).Length / 1KB, 2)) KB" -ForegroundColor White
     Write-Host "     CSV size  : $([math]::Round((Get-Item $script:OutputPathCSV).Length / 1KB, 2)) KB" -ForegroundColor White
     Write-Host "     LOG size  : $([math]::Round((Get-Item $script:LogPath).Length / 1KB, 2)) KB" -ForegroundColor White
-    Write-Host "     Encoding  : UTF-8 with BOM (JSON/CSV/log)" -ForegroundColor White
+    Write-Host "     Encoding  : UTF-8 (JSON/log), UTF-8 with BOM (CSV for Excel)" -ForegroundColor White
     Write-Host "     Applications: $($consolidation.Applications.Count)" -ForegroundColor White
 
     Show-ExecutionAnomalySummary
