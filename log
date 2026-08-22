@@ -1,0 +1,37 @@
+============================================================
+REFA x DSO360 x Checkmarx SAST - Security KPI Extract
+Start time : 2026-08-22 20:39:08
+Machine    : L0095299
+User       : BWT40FH
+PowerShell : 5.1.26100.8457
+Encoding   : UTF-8
+============================================================
+
+[2026-08-22 20:39:08] [INFO] [STARTUP] [System=N/A] [Http=N/A] [Endpoint=N/A] Script started.
+[2026-08-22 20:39:09] [INFO] [PlatformAvailability] [System=REFA] [Http=N/A] [Endpoint=https://refa-group.d.bbg/] Platform is reachable.
+[2026-08-22 20:39:09] [INFO] [PlatformAvailability] [System=DSO360] [Http=N/A] [Endpoint=https://dso360.mycloud.intranatixis.com/] Platform is reachable.
+[2026-08-22 20:39:09] [INFO] [Authentication] [System=REFA] [Http=N/A] [Endpoint=N/A] Browser opened for initial token retrieval.
+[2026-08-22 20:39:25] [INFO] [TokenValidation-REFA] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:25] [INFO] [TokenValidation-REFA] [System=REFA] [Http=N/A] [Endpoint=N/A] REFA token validated successfully.
+[2026-08-22 20:39:25] [INFO] [AuthenticationValidation] [System=REFA] [Http=N/A] [Endpoint=N/A] Valid token confirmed.
+[2026-08-22 20:39:25] [INFO] [Authentication] [System=DSO360] [Http=N/A] [Endpoint=N/A] Browser opened for initial token retrieval.
+[2026-08-22 20:39:42] [INFO] [TokenValidation-DSO360] [System=DSO360] [Http=N/A] [Endpoint=/dso-api/v1/sca/scan/summary] DSO360 token validated successfully.
+[2026-08-22 20:39:42] [INFO] [AuthenticationValidation] [System=DSO360] [Http=N/A] [Endpoint=N/A] Valid token confirmed.
+[2026-08-22 20:39:42] [INFO] [REFA-COUNT] [System=REFA] [Http=N/A] [Endpoint=/api/application/count] Trying REFA endpoint.
+[2026-08-22 20:39:42] [INFO] [REFA-COUNT] [System=REFA] [Http=N/A] [Endpoint=N/A] Total applications: 420 (source=COUNT_ENDPOINT)
+[2026-08-22 20:39:42] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:43] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:44] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:44] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:45] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:46] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:47] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:48] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:48] [INFO] [REFA-SEARCH] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:49] [INFO] [REFA-NATURE] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:50] [INFO] [REFA-NATURE] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:50] [INFO] [REFA-NATURE] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:39:52] [INFO] [REFA-NATURE] [System=REFA] [Http=N/A] [Endpoint=/api/application/search] Trying REFA endpoint.
+[2026-08-22 20:43:20] [INFO] [SUMMARY] [System=N/A] [Http=N/A] [Endpoint=N/A] End-of-run summary: warnings=0, errors=0
+[2026-08-22 20:43:20] [INFO] [END] [System=N/A] [Http=N/A] [Endpoint=N/A] Script completed.
+[2026-08-22 20:43:20] [INFO] [FINALLY] [System=N/A] [Http=N/A] [Endpoint=N/A] Execution duration: 00:04:11
