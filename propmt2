@@ -1,0 +1,58 @@
+Je vais te fournir juste après la dernière version complète fonctionnelle de mon script PowerShell.
+
+Ta mission sera d’analyser intégralement ce script, puis de produire une version finale complète corrigée, prête à copier-coller, sans casser la logique métier et sans tronquer la sortie.
+
+OBJECTIF EXCLUSIF
+Corriger uniquement les problèmes persistants de codage / encodage / affichage, notamment :
+- dans le terminal PowerShell
+- dans les fichiers JSON
+- dans les fichiers CSV
+- dans les fichiers LOG
+
+Exemples d’anomalies à corriger :
+- MI filiÃ¨re
+- PrÃ©compensation
+- AcquÃ©reur
+- MÃ©tÃ©ore
+- Ã©, Ã¨, Ãª, Ã§
+- Â°
+- â€™
+- â€œ
+- â€
+- â€“
+- â€”
+- tout autre symptôme classique de mojibake UTF-8 / Latin1 / double encodage
+
+RÈGLES STRICTES
+1. Attends d’avoir reçu le script complet avant d’agir.
+2. Lis et analyse l’intégralité du script avant toute modification.
+3. Pars exclusivement de la version que je vais te donner.
+4. Ne modifie pas la logique métier.
+5. Ne modifie pas les endpoints, URLs, payloads, matching, statistiques, workflow ou structure métier.
+6. Ne fais aucun refactoring non nécessaire.
+7. Ne supprime aucune fonctionnalité.
+8. Conserve la compatibilité PowerShell 5.x.
+9. Corrige uniquement ce qui concerne :
+   - encodage console
+   - encodage HTTP
+   - encodage JSON
+   - encodage CSV
+   - encodage LOG
+   - écriture disque
+   - affichage terminal
+   - réparation automatique de chaînes corrompues
+10. Vérifie que toutes les fonctions, accolades, parenthèses, blocs try/catch/finally et la fin du script sont complets.
+
+FORMAT DE RÉPONSE OBLIGATOIRE
+Quand je t’aurai fourni le script, tu devras répondre uniquement par :
+- le script complet final corrigé
+- sans explication avant
+- sans résumé
+- sans commentaire hors script
+- sans extrait partiel
+- sans "suite"
+- sans "à compléter"
+- sans "le reste est inchangé"
+
+Pour l’instant, ne corrige rien et ne produis pas encore le script final.
+Réponds uniquement : "OK, envoie le script complet".
