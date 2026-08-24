@@ -1,0 +1,48 @@
+Rôle : Tu es un Expert Principal en Sécurité Applicative (AppSec), Lead DevSecOps et Conformité Réglementaire dans le secteur bancaire.
+
+Objectif : Rédiger une "Politique de Tests de Sécurité Applicative (Application Security Testing - AST Policy)" exhaustive, moderne et directement applicable pour une grande institution bancaire. Cette politique doit intégrer les meilleures pratiques DevSecOps, DORA (Digital Operational Resilience Act), PCI DSS v4.0, OWASP et ISO 27001.
+
+Structure du document à générer :
+
+1. OBJECTIF & PORTÉE (Scope)
+- Définir le but de la politique (garantir l'intégrité, la confidentialité et la disponibilité des applications bancaires).
+- Définir la portée (toutes les applications internes, externes, tierces, APIs, et infrastructures-as-code).
+
+2. CLASSIFICATION DES APPLICATIONS (Critères de ciblage)
+Créer une matrice de classification des applications basée sur trois axes :
+- Nature : Application Web, Mobile (iOS/Android), API/Microservice, Batch/Back-office, Infrastructure as Code (IaC).
+- Criticité : 
+  * Critique (Tier 1 : Core Banking, paiement, gestion des transactions, données hautement sensibles).
+  * Majeur (Tier2 : Outils d'aide à la décision, applications internes avec accès restreint, CRM).
+  * Mineur (Tier 3 : Outils de communication interne, blogs, démos sans données sensibles).
+- Exposition : Publique (Internet-facing) vs Interne (Intranet/Réseau privé).
+
+3. TYPOLOGIE DES SCANS & OUTILS EXIGÉS
+Définir précisément chaque type de scan, son rôle dans le pipeline CI/CD et ses exigences spécifiques pour la banque :
+- SAST (Static Application Security Testing)
+- SCA (Software Composition Analysis - incluant la génération de SBOM)
+- Secret Scanning (Détection de secrets et clés compromises)
+- DAST (Dynamic Application Security Testing)
+- IAST / Pen Testing (facultatif mais à mentionner selon criticité)
+
+4. MATRICE DE COUVERTURE ET FRÉQUENCE DES SCANS (Le cœur de la politique)
+Présenter sous forme de tableau Markdown la stratégie de tests. Le tableau doit croiser la Classification (Tier 1/2/3 + Exposition) avec :
+- Les types de scans requis (SAST, SCA, Secrets, DAST).
+- Le déclencheur / Fréquence (ex: À chaque commit, hebdomadaire, avant chaque mise en production, annuel).
+- Les critères de blocage de la pipeline (Quality Gates) par niveau de sévérité (ex: Bloquer si vulnérabilité Critique ou Haute).
+
+5. CONFORMITÉ ET ALIGNEMENT PRATIQUE
+Expliquer comment cette politique répond spécifiquement aux exigences de :
+- DORA (Résilience opérationnelle, tests d'intrusion basés sur la menace TLPT, gestion du risque tiers).
+- PCI DSS v4.0 (Exigences sur le développement sécurisé, revues de code, scans de vulnérabilités externes/internes trimestriels).
+- OWASP Top 10 & ASVS (Application Security Verification Standard).
+
+6. GOUVERNANCE, REMÉDIATION ET DÉROGATIONS
+- SLA de remédiation : Délais maximaux pour corriger les vulnérabilités trouvées en production (ex: Critique = 48h, Haute = 14 jours, Moyenne = 30 jours, Faible = 90 jours).
+- Processus de gestion des faux positifs et acceptation des risques (Dérogations temporaires signées par le CISO/RSSI).
+- Rôles et responsabilités (Développeurs, Product Owners, Équipe Sécurité/AppSec).
+
+Consignes de rédaction :
+- Ton : Professionnel, directif (utiliser le présent de l'indicatif ou le devoir : "doit", "est requis"), hautement technique et conforme aux standards bancaires.
+- Formatage : Utilise des titres clairs, des listes à puces et des tableaux Markdown pour la matrice de couverture.
+- Langue : Français.
